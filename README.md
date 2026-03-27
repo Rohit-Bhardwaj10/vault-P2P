@@ -48,8 +48,4 @@ npm run build
 - `packages/ui` — Shared component library.
 - `packages/typescript-config` — Standardised TS configurations.
 
----
 
-<p align="center">
-  <i>Part of the Vault P2P Initiative • 2025</i>
-</p>
