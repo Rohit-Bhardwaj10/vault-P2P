@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -67,4 +69,34 @@ func (s *SQLiteStore) Close() error {
 		return s.db.Close()
 	}
 	return nil
+}
+
+func (s *SQLiteStore) UpsertChunk(hash, filePath string, size int64) error {
+	if s.db == nil {
+		return fmt.Errorf("sqlite not initialized")
+	}
+	_, err := s.db.ExecContext(
+		context.Background(),
+		`INSERT OR REPLACE INTO chunks (hash, file_path, size) VALUES (?, ?, ?)`,
+		hash,
+		filePath,
+		size,
+	)
+	return err
+}
+
+func (s *SQLiteStore) GetChunkPath(hash string) (string, error) {
+	if s.db == nil {
+		return "", fmt.Errorf("sqlite not initialized")
+	}
+	var path string
+	err := s.db.QueryRowContext(
+		context.Background(),
+		`SELECT file_path FROM chunks WHERE hash = ?`,
+		hash,
+	).Scan(&path)
+	if err != nil {
+		return "", err
+	}
+	return path, nil
 }

@@ -1,5 +1,7 @@
 package store
 
+import "path/filepath"
+
 // DB is an interface representing local storage operations
 type DB interface {
 	Init() error
@@ -10,14 +12,21 @@ type DB interface {
 
 // Engine combines SQLite (metadata/manifests) and BoltDB (Write-Ahead Log)
 type Engine struct {
-	sqlite *SQLiteStore
-	bolt   *BoltStore
+	sqlite   *SQLiteStore
+	bolt     *BoltStore
+	chunkDir string
 }
 
 func NewEngine(dbPath, walPath string) *Engine {
+	defaultChunkDir := filepath.Join(filepath.Dir(dbPath), "chunks")
+	return NewEngineWithChunkDir(dbPath, walPath, defaultChunkDir)
+}
+
+func NewEngineWithChunkDir(dbPath, walPath, chunkDir string) *Engine {
 	return &Engine{
-		sqlite: NewSQLiteStore(dbPath),
-		bolt:   NewBoltStore(walPath),
+		sqlite:   NewSQLiteStore(dbPath),
+		bolt:     NewBoltStore(walPath),
+		chunkDir: chunkDir,
 	}
 }
 
