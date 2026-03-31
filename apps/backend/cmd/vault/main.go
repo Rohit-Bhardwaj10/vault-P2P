@@ -13,9 +13,12 @@ import (
 )
 
 var (
-	dbPath    string
-	walPath   string
-	chunkPath string
+	dbPath          string
+	walPath         string
+	chunkPath       string
+	sendParallelism int
+	sendResume      bool
+	receiveResume   bool
 )
 
 var rootCmd = &cobra.Command{
@@ -42,7 +45,10 @@ var sendCmd = &cobra.Command{
 
 		fmt.Printf("Sending file '%s' to peer '%s'...\n", args[0], args[1])
 		transport := network.NewTransport()
-		if err := transport.SendFile(context.Background(), args[1], args[0], engine); err != nil {
+		if err := transport.SendFileWithOptions(context.Background(), args[1], args[0], engine, network.SendOptions{
+			Parallelism: sendParallelism,
+			Resume:      sendResume,
+		}); err != nil {
 			fmt.Fprintf(os.Stderr, "Transfer failed: %v\n", err)
 			os.Exit(1)
 		}
@@ -64,7 +70,9 @@ var receiveCmd = &cobra.Command{
 
 		fmt.Printf("Waiting for incoming transfer on '%s'...\n", args[0])
 		transport := network.NewTransport()
-		if err := transport.ReceiveOnce(context.Background(), args[0], args[1], engine); err != nil {
+		if err := transport.ReceiveOnceWithOptions(context.Background(), args[0], args[1], engine, network.ReceiveOptions{
+			Resume: receiveResume,
+		}); err != nil {
 			fmt.Fprintf(os.Stderr, "Receive failed: %v\n", err)
 			os.Exit(1)
 		}
@@ -76,6 +84,9 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&dbPath, "db", filepath.Join("data", "vault.db"), "SQLite metadata database path")
 	rootCmd.PersistentFlags().StringVar(&walPath, "wal", filepath.Join("data", "wal.db"), "BoltDB WAL path")
 	rootCmd.PersistentFlags().StringVar(&chunkPath, "chunks", filepath.Join("data", "chunks"), "Chunk storage directory")
+	sendCmd.Flags().IntVar(&sendParallelism, "parallel", 1, "Number of workers used to process outgoing chunks")
+	sendCmd.Flags().BoolVar(&sendResume, "resume", true, "Enable resume handshake when sending")
+	receiveCmd.Flags().BoolVar(&receiveResume, "resume", true, "Enable resume tracking when receiving")
 	rootCmd.AddCommand(sendCmd, receiveCmd)
 }
 
