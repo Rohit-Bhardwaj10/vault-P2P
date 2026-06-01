@@ -58,7 +58,15 @@ func (s *SQLiteStore) Init() error {
 		manifest_a TEXT,
 		manifest_b TEXT,
 		detected_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	);`
+	);
+	CREATE TABLE IF NOT EXISTS chunk_locations (
+		chunk_hash TEXT NOT NULL,
+		peer_id    TEXT NOT NULL,
+		confirmed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (chunk_hash, peer_id)
+	);
+	CREATE INDEX IF NOT EXISTS idx_chunk_locations_hash ON chunk_locations(chunk_hash);
+	CREATE INDEX IF NOT EXISTS idx_chunk_locations_peer ON chunk_locations(peer_id);`
 
 	_, err = s.db.ExecContext(context.Background(), schema)
 	return err
@@ -99,4 +107,117 @@ func (s *SQLiteStore) GetChunkPath(hash string) (string, error) {
 		return "", err
 	}
 	return path, nil
+}
+
+// UpsertPeer records or updates a known peer's addresses and last-seen time.
+func (s *SQLiteStore) UpsertPeer(id, pubkey, addresses string, latencyMs int64) error {
+	if s.db == nil {
+		return fmt.Errorf("sqlite not initialized")
+	}
+	_, err := s.db.ExecContext(
+		context.Background(),
+		`INSERT INTO peers (id, pubkey, addresses, last_seen, latency_ms)
+		 VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)
+		 ON CONFLICT(id) DO UPDATE SET
+		   pubkey=excluded.pubkey,
+		   addresses=excluded.addresses,
+		   last_seen=CURRENT_TIMESTAMP,
+		   latency_ms=excluded.latency_ms`,
+		id, pubkey, addresses, latencyMs,
+	)
+	return err
+}
+
+// GetPeer looks up a peer by its ID. Returns sql.ErrNoRows if not found.
+func (s *SQLiteStore) GetPeer(id string) (pubkey, addresses string, latencyMs int64, err error) {
+	if s.db == nil {
+		return "", "", 0, fmt.Errorf("sqlite not initialized")
+	}
+	err = s.db.QueryRowContext(
+		context.Background(),
+		`SELECT pubkey, addresses, latency_ms FROM peers WHERE id = ?`,
+		id,
+	).Scan(&pubkey, &addresses, &latencyMs)
+	return
+}
+
+// RecordChunkLocation records that a given peer holds a specific chunk.
+func (s *SQLiteStore) RecordChunkLocation(chunkHash, peerID string) error {
+	if s.db == nil {
+		return fmt.Errorf("sqlite not initialized")
+	}
+	_, err := s.db.ExecContext(
+		context.Background(),
+		`INSERT INTO chunk_locations (chunk_hash, peer_id, confirmed_at)
+		 VALUES (?, ?, CURRENT_TIMESTAMP)
+		 ON CONFLICT(chunk_hash, peer_id) DO UPDATE SET confirmed_at=CURRENT_TIMESTAMP`,
+		chunkHash, peerID,
+	)
+	return err
+}
+
+// GetChunkPeers returns the IDs of all peers known to hold a given chunk.
+func (s *SQLiteStore) GetChunkPeers(chunkHash string) ([]string, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("sqlite not initialized")
+	}
+	rows, err := s.db.QueryContext(
+		context.Background(),
+		`SELECT peer_id FROM chunk_locations WHERE chunk_hash = ? ORDER BY confirmed_at DESC`,
+		chunkHash,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var peers []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		peers = append(peers, p)
+	}
+	return peers, rows.Err()
+}
+
+// GetPeerChunks returns all chunk hashes known to be held by a given peer.
+func (s *SQLiteStore) GetPeerChunks(peerID string) ([]string, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("sqlite not initialized")
+	}
+	rows, err := s.db.QueryContext(
+		context.Background(),
+		`SELECT chunk_hash FROM chunk_locations WHERE peer_id = ? ORDER BY confirmed_at DESC`,
+		peerID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var hashes []string
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			return nil, err
+		}
+		hashes = append(hashes, h)
+	}
+	return hashes, rows.Err()
+}
+
+// RemoveChunkLocation removes the record that a peer holds a chunk
+// (e.g. after confirming the peer has evicted it).
+func (s *SQLiteStore) RemoveChunkLocation(chunkHash, peerID string) error {
+	if s.db == nil {
+		return fmt.Errorf("sqlite not initialized")
+	}
+	_, err := s.db.ExecContext(
+		context.Background(),
+		`DELETE FROM chunk_locations WHERE chunk_hash = ? AND peer_id = ?`,
+		chunkHash, peerID,
+	)
+	return err
 }

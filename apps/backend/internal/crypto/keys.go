@@ -92,6 +92,11 @@ func decodeKey(encoded string) (ed25519.PublicKey, error) {
 	return ed25519.PublicKey(b), nil
 }
 
+// DecodePublicKey is the exported version of decodeKey for use outside this package.
+func DecodePublicKey(encoded string) (ed25519.PublicKey, error) {
+	return decodeKey(encoded)
+}
+
 // randomHex generates n random bytes and returns them as a hex string.
 func randomHex(n int) (string, error) {
 	b := make([]byte, n)
