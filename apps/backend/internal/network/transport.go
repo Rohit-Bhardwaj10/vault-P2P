@@ -24,15 +24,15 @@ func NewTransport() *Transport {
 }
 
 type packet struct {
-	Type        string
-	FileName    string
-	Hash        string
-	Data        []byte
-	Size        int64
-	FileSize    int64
-	FileMTime   int64
-	Index       int
-	ResumeIndex int
+	Type        string // "start", "chunk", "end", "resume"
+	FileName    string // filename being transferred
+	Hash        string // BLAKE3 hash of chunk data
+	Data        []byte // raw chunk bytes
+	Size        int64  // chunk size
+	FileSize    int64  // total file size
+	FileMTime   int64  // file modification time (for resume matching)
+	Index       int    // chunk sequence number
+	ResumeIndex int    // last received chunk index (for resume)
 }
 
 type SendOptions struct {
@@ -225,6 +225,7 @@ func (t *Transport) ReceiveOnceWithOptions(ctx context.Context, listenAddr, outp
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+
 	case result := <-acceptCh:
 		if result.err != nil {
 			return fmt.Errorf("accept connection: %w", result.err)
