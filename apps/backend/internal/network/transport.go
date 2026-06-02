@@ -2,48 +2,115 @@ package network
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
+	"math/big"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"vault-backend/internal/chunk"
 	"vault-backend/internal/store"
+
+	"github.com/quic-go/quic-go"
 )
 
-type Transport struct {
-	// Phase 1 uses direct TCP transfer; QUIC migration comes in Phase 3.
+// quicProto is the ALPN protocol identifier negotiated during the TLS handshake.
+const quicProto = "vault-p2p/1"
+
+// Transport sends and receives files over QUIC (RFC 9000).
+//
+// QUIC provides:
+//   - Multiplexed streams over a single UDP connection
+//   - Built-in TLS 1.3 (no extra round-trip for encryption)
+//   - Connection migration (survives IP change mid-transfer)
+//   - No head-of-line blocking at the transport layer
+//
+// Transport-layer identity uses a self-signed ephemeral TLS cert.
+// App-level peer identity is verified separately via Ed25519 capability tokens.
+type Transport struct{}
+
+func NewTransport() *Transport { return &Transport{} }
+
+// serverTLSConfig generates a fresh self-signed ECDSA certificate for each
+// QUIC listener. The cert is ephemeral — app-level identity is handled by
+// Ed25519 capability tokens, not TLS certificates.
+func serverTLSConfig() (*tls.Config, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate TLS key: %w", err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "vault-p2p"},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	pub := key.Public()
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, pub, key)
+	if err != nil {
+		return nil, fmt.Errorf("create TLS cert: %w", err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{{
+			Certificate: [][]byte{certDER},
+			PrivateKey:  key,
+		}},
+		NextProtos: []string{quicProto},
+	}, nil
 }
 
-func NewTransport() *Transport {
-	return &Transport{}
+// clientTLSConfig returns a TLS config for outgoing QUIC connections.
+// InsecureSkipVerify is intentional: the receiver uses a self-signed cert, and
+// we perform app-level authentication via Ed25519 capability tokens instead.
+func clientTLSConfig() *tls.Config {
+	return &tls.Config{
+		InsecureSkipVerify: true, //nolint:gosec // deliberate; app-level auth via Ed25519
+		NextProtos:         []string{quicProto},
+	}
 }
 
+// packet is the gob-encoded wire unit for the file transfer protocol.
 type packet struct {
-	Type        string // "start", "chunk", "end", "resume"
-	FileName    string // filename being transferred
-	Hash        string // BLAKE3 hash of chunk data
+	Type        string // "start" | "resume" | "chunk" | "end"
+	FileName    string // basename of the file being transferred
+	Hash        string // BLAKE3 hex hash of the chunk data
 	Data        []byte // raw chunk bytes
-	Size        int64  // chunk size
-	FileSize    int64  // total file size
-	FileMTime   int64  // file modification time (for resume matching)
-	Index       int    // chunk sequence number
-	ResumeIndex int    // last received chunk index (for resume)
+	Size        int64  // chunk length in bytes
+	FileSize    int64  // total file size (sent in "start")
+	FileMTime   int64  // file modification time nanoseconds (for resume matching)
+	Index       int    // chunk sequence number (zero-based)
+	ResumeIndex int    // last received chunk index sent back by receiver
 }
 
+// SendOptions controls parallelism and resume behaviour for outgoing transfers.
 type SendOptions struct {
-	Parallelism int
-	Resume      bool
+	Parallelism int  // number of goroutines that hash/persist chunks concurrently
+	Resume      bool // perform the resume handshake on connect
 }
 
+// ReceiveOptions controls resume behaviour and provides an optional ready hook.
 type ReceiveOptions struct {
 	Resume bool
+	// OnListening is called once the QUIC listener is bound and accepting.
+	// The argument is the actual listen address (e.g. "0.0.0.0:50234").
+	// Useful in tests and callers that need to know the ephemeral port.
+	OnListening func(addr string)
 }
 
+// resumeState is persisted as a JSON sidecar (filename + ".resume.json") so
+// the receiver can tell the sender which chunks have already been written.
 type resumeState struct {
 	FileName  string `json:"file_name"`
 	FileSize  int64  `json:"file_size"`
@@ -51,10 +118,18 @@ type resumeState struct {
 	NextIndex int    `json:"next_index"`
 }
 
+// SendFile sends filePath to addr using default options (1 worker, resume on).
 func (t *Transport) SendFile(ctx context.Context, addr, filePath string, engine *store.Engine) error {
 	return t.SendFileWithOptions(ctx, addr, filePath, engine, SendOptions{Parallelism: 1, Resume: true})
 }
 
+// SendFileWithOptions dials addr over QUIC and streams filePath in CDC chunks.
+//
+// Protocol:
+//  1. Client opens a stream and sends a "start" packet.
+//  2. Server responds with a "resume" packet indicating the next chunk index.
+//  3. Client streams "chunk" packets (parallel workers, in-order delivery).
+//  4. Client sends "end" to signal completion.
 func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath string, engine *store.Engine, opts SendOptions) error {
 	if opts.Parallelism < 1 {
 		opts.Parallelism = 1
@@ -71,15 +146,22 @@ func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath stri
 		return fmt.Errorf("stat source file: %w", err)
 	}
 
-	dialer := net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	conn, err := quic.DialAddr(ctx, addr, clientTLSConfig(), nil)
 	if err != nil {
 		return fmt.Errorf("dial peer %s: %w", addr, err)
 	}
-	defer conn.Close()
+	defer conn.CloseWithError(0, "done")
 
-	enc := gob.NewEncoder(conn)
-	dec := gob.NewDecoder(conn)
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		return fmt.Errorf("open QUIC stream: %w", err)
+	}
+	defer stream.Close()
+
+	enc := gob.NewEncoder(stream)
+	dec := gob.NewDecoder(stream)
+
+	// --- Handshake: start → resume ---
 	if err := enc.Encode(packet{
 		Type:      "start",
 		FileName:  filepath.Base(filePath),
@@ -103,6 +185,7 @@ func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath stri
 		}
 	}
 
+	// --- Parallel chunk processing ---
 	chunker := NewChunkStream(f)
 	type job struct {
 		index int
@@ -162,7 +245,6 @@ func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath stri
 			idx++
 			continue
 		}
-
 		select {
 		case <-ctx.Done():
 			close(jobs)
@@ -173,6 +255,7 @@ func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath stri
 	}
 	close(jobs)
 
+	// --- In-order delivery: buffer out-of-order results, send sequentially ---
 	next := resumeIndex
 	pending := make(map[int]packet)
 	for r := range results {
@@ -197,49 +280,70 @@ func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath stri
 		return fmt.Errorf("send end packet: %w", err)
 	}
 
+	// Gracefully close the write side of the stream.
+	if err := stream.Close(); err != nil {
+		return fmt.Errorf("close stream: %w", err)
+	}
+
+	// Wait for the receiver to close its side of the stream to ensure it processed the 'end' packet.
+	_, _ = io.ReadAll(stream)
+
 	return nil
 }
 
+// ReceiveOnce listens for one incoming QUIC connection and receives one file.
 func (t *Transport) ReceiveOnce(ctx context.Context, listenAddr, outputDir string, engine *store.Engine) error {
 	return t.ReceiveOnceWithOptions(ctx, listenAddr, outputDir, engine, ReceiveOptions{Resume: true})
 }
 
+// ReceiveOnceWithOptions starts a QUIC listener, accepts exactly one connection,
+// and receives one file transfer.
+//
+// Protocol (mirror of SendFileWithOptions):
+//  1. Accept one QUIC connection.
+//  2. Accept one bidirectional stream from that connection.
+//  3. Receive "start" → send "resume" → receive "chunk"* → receive "end".
 func (t *Transport) ReceiveOnceWithOptions(ctx context.Context, listenAddr, outputDir string, engine *store.Engine, opts ReceiveOptions) error {
-	listener, err := net.Listen("tcp", listenAddr)
+	tlsConf, err := serverTLSConfig()
+	if err != nil {
+		return fmt.Errorf("create TLS config: %w", err)
+	}
+
+	listener, err := quic.ListenAddr(listenAddr, tlsConf, nil)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", listenAddr, err)
 	}
-	defer listener.Close()
 
-	type acceptResult struct {
-		conn net.Conn
-		err  error
+	// Notify caller of the actual bound address (useful when listenAddr is ":0").
+	if opts.OnListening != nil {
+		opts.OnListening(listener.Addr().String())
 	}
-	acceptCh := make(chan acceptResult, 1)
+
+	// Ensure the listener is closed if ctx is cancelled while waiting for Accept.
 	go func() {
-		conn, err := listener.Accept()
-		acceptCh <- acceptResult{conn: conn, err: err}
+		<-ctx.Done()
+		_ = listener.Close()
 	}()
 
-	var conn net.Conn
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-
-	case result := <-acceptCh:
-		if result.err != nil {
-			return fmt.Errorf("accept connection: %w", result.err)
-		}
-		conn = result.conn
+	conn, err := listener.Accept(ctx)
+	_ = listener.Close() // accept exactly one connection; ignore further dials
+	if err != nil {
+		return fmt.Errorf("accept QUIC connection: %w", err)
 	}
-	defer conn.Close()
+	defer conn.CloseWithError(0, "done")
+
+	stream, err := conn.AcceptStream(ctx)
+	if err != nil {
+		return fmt.Errorf("accept QUIC stream: %w", err)
+	}
 
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
 		return fmt.Errorf("create output directory: %w", err)
 	}
 
-	dec := gob.NewDecoder(conn)
-	enc := gob.NewEncoder(conn)
+	dec := gob.NewDecoder(stream)
+	enc := gob.NewEncoder(stream)
+
 	var outFile *os.File
 	var resumePath string
 	nextIndex := 0
@@ -277,6 +381,7 @@ func (t *Transport) ReceiveOnceWithOptions(ctx context.Context, listenAddr, outp
 		}
 
 		switch p.Type {
+
 		case "start":
 			safeName := filepath.Base(p.FileName)
 			outPath := filepath.Join(outputDir, safeName)
@@ -315,10 +420,10 @@ func (t *Transport) ReceiveOnceWithOptions(ctx context.Context, listenAddr, outp
 				return fmt.Errorf("received chunk before start packet")
 			}
 			if p.Index < nextIndex {
-				continue
+				continue // already written; sender resumed from a lower index
 			}
 			if p.Index > nextIndex {
-				return fmt.Errorf("received out-of-order chunk: got %d expected %d", p.Index, nextIndex)
+				return fmt.Errorf("out-of-order chunk: got %d, expected %d", p.Index, nextIndex)
 			}
 			if chunk.HashChunk(p.Data) != p.Hash {
 				return fmt.Errorf("chunk hash mismatch for %s", p.Hash)
@@ -365,10 +470,10 @@ func (t *Transport) ReceiveOnceWithOptions(ctx context.Context, listenAddr, outp
 			return fmt.Errorf("close output file: %w", err)
 		}
 	}
-
 	return nil
 }
 
+// NewChunkStream wraps r in a BufferedChunker for use by the transport.
 func NewChunkStream(r io.Reader) *chunk.BufferedChunker {
 	return chunk.NewBufferedChunker(r)
 }

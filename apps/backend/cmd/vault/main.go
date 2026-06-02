@@ -25,6 +25,7 @@ var (
 	sendResume      bool
 	receiveResume   bool
 	relayAddr       string
+	identityPath    string
 )
 
 var rootCmd = &cobra.Command{
@@ -142,11 +143,9 @@ var shareInviteCmd = &cobra.Command{
 	Short: "Create a signed invite token for a peer",
 	Args:  cobra.ExactArgs(2),
 	Run: func(cmd *cobra.Command, args []string) {
-		// For the scaffold, we generate a temporary issuer identity.
-		// In a full implementation this would load the node's persistent identity.
-		issuer, err := crypto.GenerateIdentity()
+		issuer, err := loadOrGenerateIdentity(identityPath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to generate identity: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Failed to load identity: %v\n", err)
 			os.Exit(1)
 		}
 
@@ -193,8 +192,9 @@ var relayServeCmd = &cobra.Command{
 	Short: "Start the relay server (e.g. vault relay serve :9090)",
 	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		srv := relay.NewServer(args[0], 24*time.Hour)
-		fmt.Printf("Starting relay server on %s...\n", args[0])
+		dbPath := filepath.Join("data", "relay.db")
+		srv := relay.NewServer(args[0], dbPath, 24*time.Hour)
+		fmt.Printf("Starting relay server on %s (db: %s)...\n", args[0], dbPath)
 		if err := srv.Run(context.Background()); err != nil {
 			fmt.Fprintf(os.Stderr, "Relay server error: %v\n", err)
 			os.Exit(1)
@@ -303,6 +303,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&walPath, "wal", filepath.Join("data", "wal.db"), "BoltDB WAL path")
 	rootCmd.PersistentFlags().StringVar(&chunkPath, "chunks", filepath.Join("data", "chunks"), "Chunk storage directory")
 	rootCmd.PersistentFlags().StringVar(&relayAddr, "relay", "", "Relay server address (optional fallback)")
+	rootCmd.PersistentFlags().StringVar(&identityPath, "identity", filepath.Join("data", "identity.key"), "Node identity private key path")
 
 	sendCmd.Flags().IntVar(&sendParallelism, "parallel", 1, "Number of workers used to process outgoing chunks")
 	sendCmd.Flags().BoolVar(&sendResume, "resume", true, "Enable resume handshake when sending")
@@ -327,6 +328,23 @@ func initEngine() (*store.Engine, error) {
 		return nil, err
 	}
 	return engine, nil
+}
+
+func loadOrGenerateIdentity(path string) (*crypto.Identity, error) {
+	if _, err := os.Stat(path); err == nil {
+		return crypto.LoadIdentity(path)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	id, err := crypto.GenerateIdentity()
+	if err != nil {
+		return nil, err
+	}
+	if err := crypto.SaveIdentity(path, id); err != nil {
+		return nil, err
+	}
+	return id, nil
 }
 
 func formatUnix(ts int64) string {

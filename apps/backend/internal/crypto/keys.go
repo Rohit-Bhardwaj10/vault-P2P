@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 )
 
 // Identity represents a peer's Ed25519 keypair
@@ -23,6 +24,27 @@ func GenerateIdentity() (*Identity, error) {
 		return nil, err
 	}
 	return &Identity{PublicKey: pub, PrivateKey: priv}, nil
+}
+
+// SaveIdentity writes the private key to the given file path.
+func SaveIdentity(path string, id *Identity) error {
+	return os.WriteFile(path, id.PrivateKey, 0o600)
+}
+
+// LoadIdentity reads the private key from the given file path.
+func LoadIdentity(path string) (*Identity, error) {
+	priv, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(priv) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("invalid private key length: %d", len(priv))
+	}
+	privateKey := ed25519.PrivateKey(priv)
+	// Extract public key from the private key (last 32 bytes)
+	publicKey := make(ed25519.PublicKey, ed25519.PublicKeySize)
+	copy(publicKey, privateKey[32:])
+	return &Identity{PublicKey: publicKey, PrivateKey: privateKey}, nil
 }
 
 // Encrypt encrypts a chunk using AES-256-GCM

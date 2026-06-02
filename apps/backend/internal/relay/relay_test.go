@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -19,7 +20,7 @@ func startTestServer(t *testing.T) (*Server, string, context.CancelFunc) {
 	addr := ln.Addr().String()
 	_ = ln.Close() // release so the relay server can bind to it
 
-	srv := NewServer(addr, 0) // maxAge=0 means no eviction
+	srv := NewServer(addr, filepath.Join(t.TempDir(), "relay.db"), 0) // maxAge=0 means no eviction
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go func() {
@@ -34,7 +35,9 @@ func startTestServer(t *testing.T) (*Server, string, context.CancelFunc) {
 }
 
 func TestRelayPushAndPullInProcess(t *testing.T) {
-	srv := NewServer(":0", 0)
+	srv := NewServer(":0", filepath.Join(t.TempDir(), "relay.db"), 0)
+	if err := srv.Init(); err != nil { t.Fatal(err) }
+	defer srv.Close()
 
 	data := []byte("encrypted-chunk-data")
 	if err := srv.Push("peer-bob", "hash-abc", data); err != nil {
@@ -54,7 +57,9 @@ func TestRelayPushAndPullInProcess(t *testing.T) {
 }
 
 func TestRelayPullDrains(t *testing.T) {
-	srv := NewServer(":0", 0)
+	srv := NewServer(":0", filepath.Join(t.TempDir(), "relay.db"), 0)
+	if err := srv.Init(); err != nil { t.Fatal(err) }
+	defer srv.Close()
 
 	_ = srv.Push("peer-x", "h1", []byte("d1"))
 	_ = srv.Push("peer-x", "h2", []byte("d2"))
@@ -71,7 +76,9 @@ func TestRelayPullDrains(t *testing.T) {
 }
 
 func TestRelayInboxSize(t *testing.T) {
-	srv := NewServer(":0", 0)
+	srv := NewServer(":0", filepath.Join(t.TempDir(), "relay.db"), 0)
+	if err := srv.Init(); err != nil { t.Fatal(err) }
+	defer srv.Close()
 	_ = srv.Push("peer-s", "h1", []byte("x"))
 	_ = srv.Push("peer-s", "h2", []byte("y"))
 
@@ -149,7 +156,9 @@ func TestRelayMultiplePeers(t *testing.T) {
 }
 
 func TestRelayChunkTooLarge(t *testing.T) {
-	srv := NewServer(":0", 0)
+	srv := NewServer(":0", filepath.Join(t.TempDir(), "relay.db"), 0)
+	if err := srv.Init(); err != nil { t.Fatal(err) }
+	defer srv.Close()
 	huge := make([]byte, MaxChunkSize+1)
 	err := srv.Push("peer-big", "hash-big", huge)
 	if err == nil {
@@ -158,7 +167,9 @@ func TestRelayChunkTooLarge(t *testing.T) {
 }
 
 func TestRelayEviction(t *testing.T) {
-	srv := NewServer(":0", 50*time.Millisecond) // very short maxAge
+	srv := NewServer(":0", filepath.Join(t.TempDir(), "relay.db"), 50*time.Millisecond) // very short maxAge
+	if err := srv.Init(); err != nil { t.Fatal(err) }
+	defer srv.Close()
 	_ = srv.Push("peer-ev", "old-hash", []byte("old data"))
 
 	if srv.InboxSize("peer-ev") != 1 {

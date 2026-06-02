@@ -23,47 +23,90 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"path/filepath"
 	"sync"
 	"time"
+	"os"
+
+	"go.etcd.io/bbolt"
 )
 
 // MaxChunkSize is the largest chunk payload (bytes) the relay will buffer per message.
 const MaxChunkSize = 8 * 1024 * 1024 // 8 MiB
 
+var bucketInbox = []byte("inbox")
+
 // RelayedChunk is a buffered chunk waiting for a recipient to pull it.
 type RelayedChunk struct {
-	ChunkHash string
-	Data      []byte
-	PushedAt  time.Time
+	ChunkHash string    `json:"chunk_hash"`
+	Data      []byte    `json:"data"`
+	PushedAt  time.Time `json:"pushed_at"`
 }
 
 // Server is a lightweight relay that buffers encrypted chunks for offline peers.
-// Each peer has an inbox (a FIFO queue of RelayedChunks).
 type Server struct {
-	addr string
+	addr   string
+	dbPath string
+	db     *bbolt.DB
 
 	mu     sync.Mutex
-	inbox  map[string][]*RelayedChunk // peerID → pending chunks
-	maxAge time.Duration              // how long to keep buffered chunks
+	maxAge time.Duration // how long to keep buffered chunks
 }
 
 // NewServer creates a relay Server that listens on addr.
 // maxAge is how long chunks are kept before being evicted (0 = keep forever).
-func NewServer(addr string, maxAge time.Duration) *Server {
+func NewServer(addr, dbPath string, maxAge time.Duration) *Server {
 	return &Server{
 		addr:   addr,
-		inbox:  make(map[string][]*RelayedChunk),
+		dbPath: dbPath,
 		maxAge: maxAge,
 	}
 }
 
+// Init creates the database and buckets.
+func (s *Server) Init() error {
+	if s.db != nil {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(s.dbPath), 0o755); err != nil {
+		return fmt.Errorf("create relay db dir: %w", err)
+	}
+	db, err := bbolt.Open(s.dbPath, 0o600, &bbolt.Options{Timeout: 2 * time.Second})
+	if err != nil {
+		return fmt.Errorf("open relay db: %w", err)
+	}
+	s.db = db
+
+	if err := s.db.Update(func(tx *bbolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(bucketInbox)
+		return err
+	}); err != nil {
+		return fmt.Errorf("create relay bucket: %w", err)
+	}
+	return nil
+}
+
+// Close gracefully closes the database.
+func (s *Server) Close() error {
+	if s.db != nil {
+		return s.db.Close()
+	}
+	return nil
+}
+
 // Run starts the relay server and blocks until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
+	if err := s.Init(); err != nil {
+		return err
+	}
+	// We handle DB Close() manually in cmd or here if we want, but it's safe to defer it here for simple lifecycle.
+	defer s.Close()
+
 	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		return fmt.Errorf("relay listen %s: %w", s.addr, err)
 	}
-	log.Printf("[relay] listening on %s", s.addr)
+	log.Printf("[relay] listening on %s, db %s", s.addr, s.dbPath)
 
 	go func() {
 		<-ctx.Done()
@@ -90,27 +133,62 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
-// Push directly inserts a chunk into a peer's inbox (useful for tests / same-process embedding).
+// Push inserts a chunk into a peer's inbox.
 func (s *Server) Push(recipientID, chunkHash string, data []byte) error {
 	if len(data) > MaxChunkSize {
 		return fmt.Errorf("chunk too large: %d bytes", len(data))
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.inbox[recipientID] = append(s.inbox[recipientID], &RelayedChunk{
-		ChunkHash: chunkHash,
-		Data:      data,
-		PushedAt:  time.Now(),
+
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(bucketInbox)
+		peerBucket, err := b.CreateBucketIfNotExists([]byte(recipientID))
+		if err != nil {
+			return err
+		}
+		seq, _ := peerBucket.NextSequence()
+		key := []byte(fmt.Sprintf("%010d", seq))
+		
+		chunk := &RelayedChunk{
+			ChunkHash: chunkHash,
+			Data:      data,
+			PushedAt:  time.Now(),
+		}
+		encoded, err := json.Marshal(chunk)
+		if err != nil {
+			return err
+		}
+		return peerBucket.Put(key, encoded)
 	})
-	return nil
 }
 
 // Pull drains and returns all buffered chunks for a given peer.
 func (s *Server) Pull(peerID string) []*RelayedChunk {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	chunks := s.inbox[peerID]
-	delete(s.inbox, peerID)
+	
+	var chunks []*RelayedChunk
+	
+	_ = s.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(bucketInbox)
+		peerBucket := b.Bucket([]byte(peerID))
+		if peerBucket == nil {
+			return nil // no inbox for peer
+		}
+		
+		_ = peerBucket.ForEach(func(k, v []byte) error {
+			var chunk RelayedChunk
+			if err := json.Unmarshal(v, &chunk); err == nil {
+				chunks = append(chunks, &chunk)
+			}
+			return nil
+		})
+		
+		// Drain by deleting the bucket
+		return b.DeleteBucket([]byte(peerID))
+	})
+	
 	return chunks
 }
 
@@ -118,7 +196,18 @@ func (s *Server) Pull(peerID string) []*RelayedChunk {
 func (s *Server) InboxSize(peerID string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.inbox[peerID])
+	
+	var count int
+	_ = s.db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(bucketInbox)
+		peerBucket := b.Bucket([]byte(peerID))
+		if peerBucket == nil {
+			return nil
+		}
+		count = peerBucket.Stats().KeyN
+		return nil
+	})
+	return count
 }
 
 // -- Wire protocol -------------------------------------------------------
@@ -217,17 +306,50 @@ func (s *Server) evict() {
 	cutoff := time.Now().Add(-s.maxAge)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for peer, chunks := range s.inbox {
-		var keep []*RelayedChunk
-		for _, c := range chunks {
-			if c.PushedAt.After(cutoff) {
-				keep = append(keep, c)
+
+	_ = s.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(bucketInbox)
+		if b == nil {
+			return nil
+		}
+
+		// Find all peer buckets
+		c := b.Cursor()
+		var peers [][]byte
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			if v == nil { // bucket
+				peers = append(peers, k)
 			}
 		}
-		if len(keep) == 0 {
-			delete(s.inbox, peer)
-		} else {
-			s.inbox[peer] = keep
+
+		for _, peer := range peers {
+			peerBucket := b.Bucket(peer)
+			if peerBucket == nil {
+				continue
+			}
+
+			// Find expired chunks
+			pc := peerBucket.Cursor()
+			var expired [][]byte
+			for k, v := pc.First(); k != nil; k, v = pc.Next() {
+				var chunk RelayedChunk
+				if err := json.Unmarshal(v, &chunk); err == nil {
+					if chunk.PushedAt.Before(cutoff) {
+						expired = append(expired, k)
+					}
+				}
+			}
+
+			// Delete expired chunks
+			for _, k := range expired {
+				_ = peerBucket.Delete(k)
+			}
+
+			// Delete bucket if empty
+			if peerBucket.Stats().KeyN == 0 {
+				_ = b.DeleteBucket(peer)
+			}
 		}
-	}
+		return nil
+	})
 }
