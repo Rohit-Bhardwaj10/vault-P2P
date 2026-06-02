@@ -120,3 +120,95 @@ func TestIntegration_WAL_QUIC(t *testing.T) {
 		t.Errorf("Expected WAL queue to be empty, got %d", len(pending))
 	}
 }
+
+func TestIntegration_PeerDropsDuringTransfer(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "vault.db")
+	walPath := filepath.Join(tempDir, "wal.db")
+	chunkPath := filepath.Join(tempDir, "chunks")
+	outDir := filepath.Join(tempDir, "out")
+
+	// Create a larger test file so transfer doesn't finish instantly
+	testFile := filepath.Join(tempDir, "large_test.bin")
+	testData := make([]byte, 1024*1024*5) // 5 MB
+	if err := os.WriteFile(testFile, testData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	engine := store.NewEngineWithChunkDir(dbPath, walPath, chunkPath)
+	if err := engine.Init(); err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	peerID := "peer-drop"
+	peerAddr := "127.0.0.1:0"
+
+	payload, _ := json.Marshal(map[string]string{
+		"file_path": testFile,
+		"peer_addr": peerAddr,
+	})
+
+	_, err := engine.EnqueueWAL(peerID, "send_file", payload)
+	if err != nil {
+		t.Fatal("Failed to enqueue:", err)
+	}
+
+	recvReady := make(chan string)
+	recvDone := make(chan error)
+	transport := network.NewTransport()
+
+	// Receiver context will be cancelled after 50ms to simulate drop
+	ctxRecv, cancelRecv := context.WithCancel(context.Background())
+
+	go func() {
+		err := transport.ReceiveOnceWithOptions(ctxRecv, peerAddr, outDir, engine, network.ReceiveOptions{
+			Resume: true,
+			OnListening: func(addr string) {
+				recvReady <- addr
+			},
+		})
+		recvDone <- err
+	}()
+
+	actualAddr := <-recvReady
+
+	// Cancel receiver shortly after starting sender
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancelRecv()
+	}()
+
+	deliveryFn := func(ctx context.Context, pid string, entry *store.WALEntry) error {
+		var p map[string]string
+		_ = json.Unmarshal(entry.Payload, &p)
+
+		return transport.SendFileWithOptions(ctx, actualAddr, p["file_path"], engine, network.SendOptions{
+			Parallelism: 1,
+			Resume:      true,
+		})
+	}
+
+	coord := sync.NewCoordinator(engine, deliveryFn)
+	
+	err = coord.DrainPeer(context.Background(), peerID)
+	// We expect DrainPeer to succeed in iterating, but the actual delivery should fail
+	if err != nil {
+		t.Fatalf("DrainPeer unexpectedly returned error: %v", err)
+	}
+
+	<-recvDone // Wait for receiver to finish failing
+
+	// Verify WAL entry remains and has retries > 0
+	pending, err := engine.GetPendingWAL(peerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("Expected 1 WAL entry pending after failure, got %d", len(pending))
+	}
+	if pending[0].Retries != 1 {
+		t.Errorf("Expected WAL entry to have 1 retry, got %d", pending[0].Retries)
+	}
+}
+
