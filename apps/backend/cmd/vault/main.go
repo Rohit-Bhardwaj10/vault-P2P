@@ -2,14 +2,18 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"vault-backend/internal/crypto"
 	"vault-backend/internal/network"
+	"vault-backend/internal/node"
 	"vault-backend/internal/relay"
 	"vault-backend/internal/store"
 	"vault-backend/internal/sync"
@@ -24,17 +28,61 @@ var (
 	sendParallelism int
 	sendResume      bool
 	receiveResume   bool
+	receiveAuth     bool
 	relayAddr       string
 	identityPath    string
+	spaceID         string
+	recipientPubkey string
+	recipientID     string
+	peerID          string
+	apiPort         int
+	mdnsPort        int
+	outputDir       string
 )
 
 var rootCmd = &cobra.Command{
 	Use:   "vault",
 	Short: "Vault P2P Node",
 	Long:  "Vault P2P is a private encrypted peer-to-peer file sharing node.",
+}
+
+// ---------------------------------------------------------------------------
+// vault run
+// ---------------------------------------------------------------------------
+
+var runCmd = &cobra.Command{
+	Use:   "run",
+	Short: "Start the Vault node (WAL worker, mDNS, relay poll, API)",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("Starting Vault P2P node...")
-		// Initialization of Network, Storage, and API will happen here.
+		if peerID == "" {
+			fmt.Fprintf(os.Stderr, "Error: --peer-id is required for vault run\n")
+			os.Exit(1)
+		}
+		if outputDir == "" {
+			outputDir = filepath.Join("data", "inbox")
+		}
+
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+
+		n := node.New(node.Config{
+			DBPath:       dbPath,
+			WALPath:      walPath,
+			ChunkPath:    chunkPath,
+			IdentityPath: identityPath,
+			OutputDir:    outputDir,
+			PeerID:       peerID,
+			APIPort:      apiPort,
+			MDNSPort:     mdnsPort,
+			RelayAddr:    relayAddr,
+			SpaceID:      spaceID,
+		})
+
+		fmt.Printf("Starting Vault node (peer=%s, api=:%d)...\n", peerID, apiPort)
+		if err := n.Run(ctx); err != nil && ctx.Err() == nil {
+			fmt.Fprintf(os.Stderr, "Node error: %v\n", err)
+			os.Exit(1)
+		}
 	},
 }
 
@@ -43,8 +91,8 @@ var rootCmd = &cobra.Command{
 // ---------------------------------------------------------------------------
 
 var sendCmd = &cobra.Command{
-	Use:   "send [file] [peer_id]",
-	Short: "Send a file directly to a peer (queues in WAL if peer offline)",
+	Use:   "send [file] [peer_addr]",
+	Short: "Send a file to a peer (WAL-first, encrypted when --space is set)",
 	Args:  cobra.ExactArgs(2),
 	Run: func(cmd *cobra.Command, args []string) {
 		engine, err := initEngine()
@@ -56,29 +104,47 @@ var sendCmd = &cobra.Command{
 
 		filePath := args[0]
 		peerAddr := args[1]
+		relay := optionalRelayClient()
 
-		fmt.Printf("Sending file '%s' to peer '%s'...\n", filePath, peerAddr)
-		transport := network.NewTransport()
-		err = transport.SendFileWithOptions(context.Background(), peerAddr, filePath, engine, network.SendOptions{
+		payload, authToken, spaceKey, err := buildSendPayload(engine, filePath, peerAddr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to prepare send: %v\n", err)
+			os.Exit(1)
+		}
+		payloadBytes, _ := json.Marshal(payload)
+
+		entry, err := engine.EnqueueWAL(peerAddr, "send_file", payloadBytes)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to enqueue WAL: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("Sending file '%s' to '%s' (WAL entry %s)...\n", filePath, peerAddr, entry.ID)
+
+		recipient := recipientID
+		if recipient == "" {
+			recipient = peerAddr
+		}
+
+		d := &network.Deliverer{
+			Transport:   network.NewTransport(),
+			Relay:       relay,
+			AuthToken:   authToken,
+			SpaceKey:    spaceKey,
+			PeerAddr:    peerAddr,
+			RecipientID: recipient,
+		}
+
+		if err := d.SendFile(context.Background(), filePath, engine, network.DeliverOptions{
 			Parallelism: sendParallelism,
 			Resume:      sendResume,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Direct transfer failed: %v\n", err)
-			fmt.Println("Queuing in WAL for retry when peer comes online...")
-
-			payload, _ := json.Marshal(map[string]string{
-				"file_path": filePath,
-				"peer_addr": peerAddr,
-			})
-			entry, qErr := engine.EnqueueWAL(peerAddr, "send_file", payload)
-			if qErr != nil {
-				fmt.Fprintf(os.Stderr, "Failed to queue in WAL: %v\n", qErr)
-				os.Exit(1)
-			}
-			fmt.Printf("Queued as WAL entry %s — will retry when peer is online.\n", entry.ID)
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "Delivery failed (will retry when peer is online): %v\n", err)
 			return
 		}
+
+		_ = engine.MarkWALDone(entry.ID)
+		_ = engine.DeleteWALEntry(entry.ID)
 		fmt.Println("Transfer completed")
 	},
 }
@@ -89,7 +155,7 @@ var sendCmd = &cobra.Command{
 
 var receiveCmd = &cobra.Command{
 	Use:   "receive [listen_addr] [output_dir]",
-	Short: "Receive one file from a peer",
+	Short: "Receive one encrypted file from a peer",
 	Args:  cobra.ExactArgs(2),
 	Run: func(cmd *cobra.Command, args []string) {
 		engine, err := initEngine()
@@ -99,10 +165,29 @@ var receiveCmd = &cobra.Command{
 		}
 		defer engine.Close()
 
+		identity, err := loadOrGenerateIdentity(identityPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to load identity: %v\n", err)
+			os.Exit(1)
+		}
+
+		var spaceKey []byte
+		if spaceID != "" {
+			space, _, err := engine.GetSpace(spaceID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to load space: %v\n", err)
+				os.Exit(1)
+			}
+			spaceKey = space.SymmetricKey
+		}
+
 		fmt.Printf("Waiting for incoming transfer on '%s'...\n", args[0])
 		transport := network.NewTransport()
 		if err := transport.ReceiveOnceWithOptions(context.Background(), args[0], args[1], engine, network.ReceiveOptions{
-			Resume: receiveResume,
+			Resume:      receiveResume,
+			RequireAuth: receiveAuth || spaceID != "",
+			Identity:    identity,
+			SpaceKey:    spaceKey,
 		}); err != nil {
 			fmt.Fprintf(os.Stderr, "Receive failed: %v\n", err)
 			os.Exit(1)
@@ -125,16 +210,34 @@ var shareCreateCmd = &cobra.Command{
 	Short: "Create a new shared space",
 	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
+		engine, err := initEngine()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to initialize storage: %v\n", err)
+			os.Exit(1)
+		}
+		defer engine.Close()
+
+		identity, err := loadOrGenerateIdentity(identityPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to load identity: %v\n", err)
+			os.Exit(1)
+		}
+
 		space, err := crypto.NewSpace(args[0])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to create space: %v\n", err)
 			os.Exit(1)
 		}
+		if err := engine.SaveSpace(space, hex.EncodeToString(identity.PublicKey)); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to persist space: %v\n", err)
+			os.Exit(1)
+		}
+
 		fmt.Printf("✓ Space created\n")
 		fmt.Printf("  ID:   %s\n", space.ID)
 		fmt.Printf("  Name: %s\n", space.Name)
-		fmt.Printf("  Key:  (stored locally — never transmitted in plaintext)\n")
 		fmt.Printf("\nTo invite a peer: vault share invite %s <peer-pubkey>\n", space.ID)
+		fmt.Printf("To send files:     vault send <file> <peer> --space %s --recipient-pubkey <hex>\n", space.ID)
 	},
 }
 
@@ -143,6 +246,13 @@ var shareInviteCmd = &cobra.Command{
 	Short: "Create a signed invite token for a peer",
 	Args:  cobra.ExactArgs(2),
 	Run: func(cmd *cobra.Command, args []string) {
+		engine, err := initEngine()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to initialize storage: %v\n", err)
+			os.Exit(1)
+		}
+		defer engine.Close()
+
 		issuer, err := loadOrGenerateIdentity(identityPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to load identity: %v\n", err)
@@ -155,11 +265,10 @@ var shareInviteCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		// Placeholder space — in production, loaded from the store.
-		space := &crypto.Space{
-			ID:           args[0],
-			Name:         "space",
-			SymmetricKey: make([]byte, 32),
+		space, _, err := engine.GetSpace(args[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Space not found: %v\n", err)
+			os.Exit(1)
 		}
 
 		invite, err := crypto.CreateInvite(issuer, space, crypto.PermWrite, 24*time.Hour)
@@ -192,9 +301,9 @@ var relayServeCmd = &cobra.Command{
 	Short: "Start the relay server (e.g. vault relay serve :9090)",
 	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		dbPath := filepath.Join("data", "relay.db")
-		srv := relay.NewServer(args[0], dbPath, 24*time.Hour)
-		fmt.Printf("Starting relay server on %s (db: %s)...\n", args[0], dbPath)
+		rdb := filepath.Join("data", "relay.db")
+		srv := relay.NewServer(args[0], rdb, 24*time.Hour)
+		fmt.Printf("Starting relay server on %s (db: %s)...\n", args[0], rdb)
 		if err := srv.Run(context.Background()); err != nil {
 			fmt.Fprintf(os.Stderr, "Relay server error: %v\n", err)
 			os.Exit(1)
@@ -255,7 +364,7 @@ var queueListCmd = &cobra.Command{
 }
 
 var queueRetryCmd = &cobra.Command{
-	Use:   "retry [peer-addr]",
+	Use:   "retry [peer-id]",
 	Short: "Trigger an immediate retry for all pending entries for a peer",
 	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
@@ -266,27 +375,12 @@ var queueRetryCmd = &cobra.Command{
 		}
 		defer engine.Close()
 
-		peerID := args[0]
-		transport := network.NewTransport()
+		peer := args[0]
+		coord := sync.NewCoordinator(engine, makeDeliverFn(engine, optionalRelayClient()))
+		coord.MarkOnline(context.Background(), peer)
 
-		deliverFn := func(ctx context.Context, pid string, entry *store.WALEntry) error {
-			var payload map[string]string
-			if err := json.Unmarshal(entry.Payload, &payload); err != nil {
-				return fmt.Errorf("bad payload: %w", err)
-			}
-			filePath := payload["file_path"]
-			peerAddr := payload["peer_addr"]
-			return transport.SendFileWithOptions(ctx, peerAddr, filePath, engine, network.SendOptions{
-				Parallelism: 1,
-				Resume:      true,
-			})
-		}
-
-		coord := sync.NewCoordinator(engine, deliverFn)
-		coord.MarkOnline(context.Background(), peerID)
-
-		fmt.Printf("Draining WAL queue for peer %s...\n", peerID)
-		if err := coord.DrainPeer(context.Background(), peerID); err != nil {
+		fmt.Printf("Draining WAL queue for peer %s...\n", peer)
+		if err := coord.DrainPeer(context.Background(), peer); err != nil {
 			fmt.Fprintf(os.Stderr, "Drain failed: %v\n", err)
 			os.Exit(1)
 		}
@@ -304,16 +398,25 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&chunkPath, "chunks", filepath.Join("data", "chunks"), "Chunk storage directory")
 	rootCmd.PersistentFlags().StringVar(&relayAddr, "relay", "", "Relay server address (optional fallback)")
 	rootCmd.PersistentFlags().StringVar(&identityPath, "identity", filepath.Join("data", "identity.key"), "Node identity private key path")
+	rootCmd.PersistentFlags().StringVar(&spaceID, "space", "", "Space ID for encrypted transfers")
+	rootCmd.PersistentFlags().StringVar(&recipientPubkey, "recipient-pubkey", "", "Recipient Ed25519 public key (hex)")
+	rootCmd.PersistentFlags().StringVar(&recipientID, "recipient-id", "", "Recipient peer ID for relay delivery")
 
 	sendCmd.Flags().IntVar(&sendParallelism, "parallel", 1, "Number of workers used to process outgoing chunks")
 	sendCmd.Flags().BoolVar(&sendResume, "resume", true, "Enable resume handshake when sending")
 	receiveCmd.Flags().BoolVar(&receiveResume, "resume", true, "Enable resume tracking when receiving")
+	receiveCmd.Flags().BoolVar(&receiveAuth, "require-auth", false, "Require capability token on incoming connections")
+
+	runCmd.Flags().StringVar(&peerID, "peer-id", "", "This node's peer ID (required)")
+	runCmd.Flags().IntVar(&apiPort, "api-port", 8080, "HTTP API port")
+	runCmd.Flags().IntVar(&mdnsPort, "mdns-port", 4242, "mDNS service port")
+	runCmd.Flags().StringVar(&outputDir, "output-dir", filepath.Join("data", "inbox"), "Directory for relay-received files")
 
 	shareCmd.AddCommand(shareCreateCmd, shareInviteCmd)
 	relayCmd.AddCommand(relayServeCmd, relayStatusCmd)
 	queueCmd.AddCommand(queueListCmd, queueRetryCmd)
 
-	rootCmd.AddCommand(sendCmd, receiveCmd, shareCmd, relayCmd, queueCmd)
+	rootCmd.AddCommand(runCmd, sendCmd, receiveCmd, shareCmd, relayCmd, queueCmd)
 }
 
 func initEngine() (*store.Engine, error) {
@@ -328,6 +431,114 @@ func initEngine() (*store.Engine, error) {
 		return nil, err
 	}
 	return engine, nil
+}
+
+func optionalRelayClient() *relay.Client {
+	if relayAddr == "" {
+		return nil
+	}
+	return relay.NewClient(relayAddr)
+}
+
+func buildSendPayload(engine *store.Engine, filePath, peerAddr string) (map[string]string, *crypto.SignedToken, []byte, error) {
+	payload := map[string]string{
+		"file_path": filePath,
+		"peer_addr": peerAddr,
+	}
+	if recipientID != "" {
+		payload["recipient_id"] = recipientID
+	}
+
+	if spaceID == "" {
+		return payload, nil, nil, nil
+	}
+
+	identity, err := loadOrGenerateIdentity(identityPath)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	space, _, err := engine.GetSpace(spaceID)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load space: %w", err)
+	}
+
+	grantee := identity.PublicKey
+	if recipientPubkey != "" {
+		grantee, err = crypto.DecodePublicKey(recipientPubkey)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("recipient pubkey: %w", err)
+		}
+	}
+
+	token, err := crypto.IssueToken(identity, grantee, space.ID, crypto.PermWrite, 24*time.Hour)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	tokJSON, err := crypto.MarshalToken(token)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	payload["auth_token"] = string(tokJSON)
+	payload["space_id"] = space.ID
+
+	return payload, token, space.SymmetricKey, nil
+}
+
+func makeDeliverFn(engine *store.Engine, relayClient *relay.Client) sync.DeliveryFunc {
+	return func(ctx context.Context, peerID string, entry *store.WALEntry) error {
+		var payload map[string]string
+		if err := json.Unmarshal(entry.Payload, &payload); err != nil {
+			return fmt.Errorf("bad payload: %w", err)
+		}
+
+		authToken, spaceKey, err := authFromPayload(engine, payload)
+		if err != nil {
+			return err
+		}
+
+		peerAddr := payload["peer_addr"]
+		if peerAddr == "" {
+			peerAddr = peerID
+		}
+		recipient := payload["recipient_id"]
+		if recipient == "" {
+			recipient = peerAddr
+		}
+
+		d := &network.Deliverer{
+			Transport:   network.NewTransport(),
+			Relay:       relayClient,
+			AuthToken:   authToken,
+			SpaceKey:    spaceKey,
+			PeerAddr:    peerAddr,
+			RecipientID: recipient,
+		}
+		return d.SendFile(ctx, payload["file_path"], engine, network.DeliverOptions{
+			Parallelism: 1,
+			Resume:      true,
+		})
+	}
+}
+
+func authFromPayload(engine *store.Engine, payload map[string]string) (*crypto.SignedToken, []byte, error) {
+	if tokJSON := payload["auth_token"]; tokJSON != "" {
+		tok, err := crypto.UnmarshalToken([]byte(tokJSON))
+		if err != nil {
+			return nil, nil, err
+		}
+		sid := payload["space_id"]
+		if sid == "" {
+			var ct crypto.CapabilityToken
+			_ = json.Unmarshal(tok.Payload, &ct)
+			sid = ct.SpaceID
+		}
+		space, _, err := engine.GetSpace(sid)
+		if err != nil {
+			return tok, nil, err
+		}
+		return tok, space.SymmetricKey, nil
+	}
+	return nil, nil, nil
 }
 
 func loadOrGenerateIdentity(path string) (*crypto.Identity, error) {

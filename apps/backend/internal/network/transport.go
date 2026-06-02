@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"crypto/ecdsa"
+	"errors"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"vault-backend/internal/chunk"
+	"vault-backend/internal/crypto"
 	"vault-backend/internal/store"
 
 	"github.com/quic-go/quic-go"
@@ -26,6 +28,8 @@ import (
 
 // quicProto is the ALPN protocol identifier negotiated during the TLS handshake.
 const quicProto = "vault-p2p/1"
+
+var errEndTransfer = errors.New("transfer complete")
 
 // Transport sends and receives files over QUIC (RFC 9000).
 //
@@ -98,11 +102,21 @@ type packet struct {
 type SendOptions struct {
 	Parallelism int  // number of goroutines that hash/persist chunks concurrently
 	Resume      bool // perform the resume handshake on connect
+	// AuthToken is sent before transfer; receiver must verify grantee.
+	AuthToken *crypto.SignedToken
+	// SpaceKey derives the per-transfer session key together with AuthToken.
+	SpaceKey []byte
 }
 
 // ReceiveOptions controls resume behaviour and provides an optional ready hook.
 type ReceiveOptions struct {
 	Resume bool
+	// RequireAuth rejects connections that do not present a valid capability token.
+	RequireAuth bool
+	// Identity is the local peer; used to verify AuthToken grantee.
+	Identity *crypto.Identity
+	// SpaceKey derives the session key after successful auth.
+	SpaceKey []byte
 	// OnListening is called once the QUIC listener is bound and accepting.
 	// The argument is the actual listen address (e.g. "0.0.0.0:50234").
 	// Useful in tests and callers that need to know the ephemeral port.
@@ -161,6 +175,11 @@ func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath stri
 	enc := gob.NewEncoder(stream)
 	dec := gob.NewDecoder(stream)
 
+	sessionKey, authErr := t.clientSessionKey(enc, dec, opts)
+	if authErr != nil {
+		return authErr
+	}
+
 	// --- Handshake: start → resume ---
 	if err := enc.Encode(packet{
 		Type:      "start",
@@ -212,12 +231,21 @@ func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath stri
 						return
 					}
 				}
+				data := j.chunk.Data
+				if len(sessionKey) > 0 {
+					var encErr error
+					data, encErr = ProtectChunk(sessionKey, data)
+					if encErr != nil {
+						results <- result{err: fmt.Errorf("encrypt chunk: %w", encErr)}
+						return
+					}
+				}
 				results <- result{
 					index: j.index,
 					packet: packet{
 						Type:  "chunk",
 						Hash:  j.chunk.Hash,
-						Data:  j.chunk.Data,
+						Data:  data,
 						Size:  j.chunk.Size,
 						Index: j.index,
 					},
@@ -344,6 +372,11 @@ func (t *Transport) ReceiveOnceWithOptions(ctx context.Context, listenAddr, outp
 	dec := gob.NewDecoder(stream)
 	enc := gob.NewEncoder(stream)
 
+	_, sessionKey, pending, err := serverAuthHandshake(dec, enc, opts.Identity, opts.RequireAuth, opts.SpaceKey)
+	if err != nil {
+		return err
+	}
+
 	var outFile *os.File
 	var resumePath string
 	nextIndex := 0
@@ -368,18 +401,7 @@ func (t *Transport) ReceiveOnceWithOptions(ctx context.Context, listenAddr, outp
 		return s, err
 	}
 
-	for {
-		var p packet
-		if err := dec.Decode(&p); err != nil {
-			if err == io.EOF {
-				break
-			}
-			if outFile != nil {
-				_ = outFile.Close()
-			}
-			return fmt.Errorf("decode packet: %w", err)
-		}
-
+	processPacket := func(p packet) error {
 		switch p.Type {
 
 		case "start":
@@ -420,19 +442,27 @@ func (t *Transport) ReceiveOnceWithOptions(ctx context.Context, listenAddr, outp
 				return fmt.Errorf("received chunk before start packet")
 			}
 			if p.Index < nextIndex {
-				continue // already written; sender resumed from a lower index
+				return nil
 			}
 			if p.Index > nextIndex {
 				return fmt.Errorf("out-of-order chunk: got %d, expected %d", p.Index, nextIndex)
 			}
-			if chunk.HashChunk(p.Data) != p.Hash {
+			plain := p.Data
+			if len(sessionKey) > 0 {
+				var decErr error
+				plain, decErr = UnprotectChunk(sessionKey, p.Data)
+				if decErr != nil {
+					return fmt.Errorf("decrypt chunk: %w", decErr)
+				}
+			}
+			if chunk.HashChunk(plain) != p.Hash {
 				return fmt.Errorf("chunk hash mismatch for %s", p.Hash)
 			}
-			if _, err := outFile.Write(p.Data); err != nil {
+			if _, err := outFile.Write(plain); err != nil {
 				return fmt.Errorf("write output file: %w", err)
 			}
 			if engine != nil {
-				if _, err := engine.WriteChunk(outFile.Name(), p.Data); err != nil {
+				if _, err := engine.WriteChunk(outFile.Name(), plain); err != nil {
 					return fmt.Errorf("persist incoming chunk: %w", err)
 				}
 			}
@@ -458,10 +488,40 @@ func (t *Transport) ReceiveOnceWithOptions(ctx context.Context, listenAddr, outp
 			if opts.Resume && resumePath != "" {
 				_ = os.Remove(resumePath)
 			}
-			return nil
+			return errEndTransfer
 
 		default:
 			return fmt.Errorf("unknown packet type %q", p.Type)
+		}
+		return nil
+	}
+
+	if pending != nil {
+		if err := processPacket(*pending); err != nil {
+			if err == errEndTransfer {
+				return nil
+			}
+			return err
+		}
+	}
+
+	for {
+		var p packet
+		if err := dec.Decode(&p); err != nil {
+			if err == io.EOF {
+				break
+			}
+			if outFile != nil {
+				_ = outFile.Close()
+			}
+			return fmt.Errorf("decode packet: %w", err)
+		}
+
+		if err := processPacket(p); err != nil {
+			if err == errEndTransfer {
+				return nil
+			}
+			return err
 		}
 	}
 
@@ -476,4 +536,14 @@ func (t *Transport) ReceiveOnceWithOptions(ctx context.Context, listenAddr, outp
 // NewChunkStream wraps r in a BufferedChunker for use by the transport.
 func NewChunkStream(r io.Reader) *chunk.BufferedChunker {
 	return chunk.NewBufferedChunker(r)
+}
+
+func (t *Transport) clientSessionKey(enc *gob.Encoder, dec *gob.Decoder, opts SendOptions) ([]byte, error) {
+	if err := runClientAuth(enc, dec, opts.AuthToken); err != nil {
+		return nil, err
+	}
+	if opts.AuthToken == nil || len(opts.SpaceKey) == 0 {
+		return nil, nil
+	}
+	return DeriveTransferSessionKey(opts.SpaceKey, opts.AuthToken)
 }

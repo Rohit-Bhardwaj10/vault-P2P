@@ -119,6 +119,11 @@ func DecodePublicKey(encoded string) (ed25519.PublicKey, error) {
 	return decodeKey(encoded)
 }
 
+// RandomHex generates n random bytes and returns them as a hex string.
+func RandomHex(n int) (string, error) {
+	return randomHex(n)
+}
+
 // randomHex generates n random bytes and returns them as a hex string.
 func randomHex(n int) (string, error) {
 	b := make([]byte, n)

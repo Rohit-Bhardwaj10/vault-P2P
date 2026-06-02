@@ -69,7 +69,12 @@ func (s *SQLiteStore) Init() error {
 	CREATE INDEX IF NOT EXISTS idx_chunk_locations_peer ON chunk_locations(peer_id);`
 
 	_, err = s.db.ExecContext(context.Background(), schema)
-	return err
+	if err != nil {
+		return err
+	}
+	// MVP: add human-readable space name (ignore error if column already exists).
+	_, _ = s.db.ExecContext(context.Background(), `ALTER TABLE spaces ADD COLUMN name TEXT DEFAULT ''`)
+	return nil
 }
 
 func (s *SQLiteStore) Close() error {
