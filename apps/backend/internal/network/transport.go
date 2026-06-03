@@ -216,6 +216,9 @@ func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath stri
 		err    error
 	}
 
+	// stopped is closed when the sender exits (error or success) so worker
+	// goroutines can detect abandonment and unblock from channel sends.
+	stopped := make(chan struct{})
 	jobs := make(chan job, opts.Parallelism*2)
 	results := make(chan result, opts.Parallelism*2)
 
@@ -227,7 +230,10 @@ func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath stri
 			for j := range jobs {
 				if engine != nil {
 					if _, err := engine.WriteChunk(filePath, j.chunk.Data); err != nil {
-						results <- result{err: fmt.Errorf("persist outgoing chunk: %w", err)}
+						select {
+						case results <- result{err: fmt.Errorf("persist outgoing chunk: %w", err)}:
+						case <-stopped:
+						}
 						return
 					}
 				}
@@ -236,11 +242,15 @@ func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath stri
 					var encErr error
 					data, encErr = ProtectChunk(sessionKey, data)
 					if encErr != nil {
-						results <- result{err: fmt.Errorf("encrypt chunk: %w", encErr)}
+						select {
+						case results <- result{err: fmt.Errorf("encrypt chunk: %w", encErr)}:
+						case <-stopped:
+						}
 						return
 					}
 				}
-				results <- result{
+				select {
+				case results <- result{
 					index: j.index,
 					packet: packet{
 						Type:  "chunk",
@@ -249,6 +259,9 @@ func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath stri
 						Size:  j.chunk.Size,
 						Index: j.index,
 					},
+				}:
+				case <-stopped:
+					return
 				}
 			}
 		}()
@@ -259,6 +272,20 @@ func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath stri
 		close(results)
 	}()
 
+	// sendErr signals workers to stop, drains remaining channel entries so no
+	// goroutines are left blocked, then returns the provided error.
+	var stopOnce sync.Once
+	stopWorkers := func() {
+		stopOnce.Do(func() { close(stopped) })
+	}
+	sendErr := func(err error) error {
+		stopWorkers()
+		// Drain results so the wg-closer goroutine can finish.
+		for range results {
+		}
+		return err
+	}
+
 	idx := 0
 	for {
 		c, err := chunker.Next()
@@ -267,7 +294,7 @@ func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath stri
 		}
 		if err != nil {
 			close(jobs)
-			return fmt.Errorf("chunk file: %w", err)
+			return sendErr(fmt.Errorf("chunk file: %w", err))
 		}
 		if idx < resumeIndex {
 			idx++
@@ -276,7 +303,7 @@ func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath stri
 		select {
 		case <-ctx.Done():
 			close(jobs)
-			return ctx.Err()
+			return sendErr(ctx.Err())
 		case jobs <- job{index: idx, chunk: c}:
 		}
 		idx++
@@ -285,24 +312,25 @@ func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath stri
 
 	// --- In-order delivery: buffer out-of-order results, send sequentially ---
 	next := resumeIndex
-	pending := make(map[int]packet)
+	pendingPkts := make(map[int]packet)
 	for r := range results {
 		if r.err != nil {
-			return r.err
+			return sendErr(r.err)
 		}
-		pending[r.index] = r.packet
+		pendingPkts[r.index] = r.packet
 		for {
-			p, ok := pending[next]
+			p, ok := pendingPkts[next]
 			if !ok {
 				break
 			}
 			if err := enc.Encode(p); err != nil {
-				return fmt.Errorf("send chunk packet: %w", err)
+				return sendErr(fmt.Errorf("send chunk packet: %w", err))
 			}
-			delete(pending, next)
+			delete(pendingPkts, next)
 			next++
 		}
 	}
+	stopWorkers() // normal completion: signal workers (all already done)
 
 	if err := enc.Encode(packet{Type: "end"}); err != nil {
 		return fmt.Errorf("send end packet: %w", err)
