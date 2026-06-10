@@ -22,22 +22,24 @@ import (
 )
 
 var (
-	dbPath          string
-	walPath         string
-	chunkPath       string
-	sendParallelism int
-	sendResume      bool
-	receiveResume   bool
-	receiveAuth     bool
-	relayAddr       string
-	identityPath    string
-	spaceID         string
-	recipientPubkey string
-	recipientID     string
-	peerID          string
-	apiPort         int
-	mdnsPort        int
-	outputDir       string
+	dbPath            string
+	walPath           string
+	chunkPath         string
+	sendParallelism   int
+	sendResume        bool
+	receiveResume     bool
+	receiveAuth       bool
+	relayAddr         string
+	identityPath      string
+	spaceID           string
+	recipientPubkey   string
+	recipientID       string
+	peerID            string
+	apiPort           int
+	mdnsPort          int
+	outputDir         string
+	rendezvousServer  string // rendezvous server base URL
+	pingAddr          string // address to ping for vault peers ping
 )
 
 var rootCmd = &cobra.Command{
@@ -138,10 +140,15 @@ var sendCmd = &cobra.Command{
 		if err := d.SendFile(context.Background(), filePath, engine, network.DeliverOptions{
 			Parallelism: sendParallelism,
 			Resume:      sendResume,
+			OnProgress: func(sent, total int64) {
+				progressBar("Sending", sent, total)
+			},
 		}); err != nil {
+			fmt.Println() // newline after progress bar
 			fmt.Fprintf(os.Stderr, "Delivery failed (will retry when peer is online): %v\n", err)
 			return
 		}
+		progressDone("Sending", fileSize(filePath))
 
 		_ = engine.MarkWALDone(entry.ID)
 		_ = engine.DeleteWALEntry(entry.ID)
@@ -415,8 +422,10 @@ func init() {
 	shareCmd.AddCommand(shareCreateCmd, shareInviteCmd)
 	relayCmd.AddCommand(relayServeCmd, relayStatusCmd)
 	queueCmd.AddCommand(queueListCmd, queueRetryCmd)
+	peersCmd.AddCommand(peersListCmd, peersPingCmd)
+	rendezvousCmd.AddCommand(rendezvousRegisterCmd, rendezvoousLookupCmd)
 
-	rootCmd.AddCommand(runCmd, sendCmd, receiveCmd, shareCmd, relayCmd, queueCmd)
+	rootCmd.AddCommand(runCmd, sendCmd, receiveCmd, shareCmd, relayCmd, queueCmd, statusCmd, peersCmd, rendezvousCmd)
 }
 
 func initEngine() (*store.Engine, error) {

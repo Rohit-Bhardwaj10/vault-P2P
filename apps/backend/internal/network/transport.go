@@ -106,6 +106,10 @@ type SendOptions struct {
 	AuthToken *crypto.SignedToken
 	// SpaceKey derives the per-transfer session key together with AuthToken.
 	SpaceKey []byte
+	// OnProgress is called after each chunk is written to the wire.
+	// bytesSent is the cumulative raw (pre-encryption) bytes sent so far.
+	// totalBytes is the full file size. May be nil.
+	OnProgress func(bytesSent, totalBytes int64)
 }
 
 // ReceiveOptions controls resume behaviour and provides an optional ready hook.
@@ -312,6 +316,7 @@ func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath stri
 
 	// --- In-order delivery: buffer out-of-order results, send sequentially ---
 	next := resumeIndex
+	var bytesSent int64
 	pendingPkts := make(map[int]packet)
 	for r := range results {
 		if r.err != nil {
@@ -325,6 +330,10 @@ func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath stri
 			}
 			if err := enc.Encode(p); err != nil {
 				return sendErr(fmt.Errorf("send chunk packet: %w", err))
+			}
+			bytesSent += p.Size
+			if opts.OnProgress != nil {
+				opts.OnProgress(bytesSent, info.Size())
 			}
 			delete(pendingPkts, next)
 			next++

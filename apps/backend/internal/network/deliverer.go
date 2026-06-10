@@ -31,7 +31,8 @@ type Deliverer struct {
 type DeliverOptions struct {
 	Parallelism int
 	Resume      bool
-	ForceRelay  bool // skip direct + hole punch, go straight to relay
+	ForceRelay  bool                         // skip direct + hole punch, go straight to relay
+	OnProgress  func(sent, total int64)      // optional progress callback
 }
 
 // SendFile delivers filePath to the configured peer using the best available path.
@@ -54,7 +55,9 @@ func (d *Deliverer) SendFile(ctx context.Context, filePath string, engine *store
 		Resume:      opts.Resume,
 		AuthToken:   d.AuthToken,
 		SpaceKey:    d.SpaceKey,
+		OnProgress:  opts.OnProgress,
 	}
+
 	if d.Transport == nil {
 		d.Transport = NewTransport()
 	}
