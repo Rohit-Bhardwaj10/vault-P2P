@@ -1,6 +1,8 @@
 package store
 
 import (
+	"time"
+
 	"go.etcd.io/bbolt"
 )
 
@@ -15,7 +17,7 @@ func NewBoltStore(path string) *BoltStore {
 
 func (s *BoltStore) Init() error {
 	var err error
-	s.db, err = bbolt.Open(s.walPath, 0600, nil)
+	s.db, err = bbolt.Open(s.walPath, 0600, &bbolt.Options{Timeout: 2 * time.Second})
 	if err != nil {
 		return err
 	}

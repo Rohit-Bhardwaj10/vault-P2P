@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/grandcat/zeroconf v1.0.0
+	github.com/quic-go/quic-go v0.59.1
 	github.com/spf13/cobra v1.10.2
 	go.etcd.io/bbolt v1.4.3
 	golang.org/x/crypto v0.41.0
@@ -20,10 +21,8 @@ require (
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/miekg/dns v1.1.27 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
-	github.com/quic-go/quic-go v0.59.1 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
-	github.com/stretchr/testify v1.11.1 // indirect
 	golang.org/x/net v0.43.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 	modernc.org/libc v1.70.0 // indirect

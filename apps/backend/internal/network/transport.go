@@ -282,13 +282,43 @@ func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath stri
 	stopWorkers := func() {
 		stopOnce.Do(func() { close(stopped) })
 	}
-	sendErr := func(err error) error {
-		stopWorkers()
-		// Drain results so the wg-closer goroutine can finish.
-		for range results {
+
+	// --- In-order delivery (concurrent with job production to prevent deadlock) ---
+	// Without this goroutine the results buffer fills while main is still feeding
+	// jobs: workers block on results<-, main blocks on jobs<-, deadlock ensues.
+	type netWriteResult struct{ err error }
+	netErrCh := make(chan netWriteResult, 1)
+	go func() {
+		next := resumeIndex
+		var bytesSent int64
+		pendingPkts := make(map[int]packet)
+		for r := range results {
+			if r.err != nil {
+				stopWorkers()
+				netErrCh <- netWriteResult{r.err}
+				return
+			}
+			pendingPkts[r.index] = r.packet
+			for {
+				p, ok := pendingPkts[next]
+				if !ok {
+					break
+				}
+				if err := enc.Encode(p); err != nil {
+					stopWorkers()
+					netErrCh <- netWriteResult{fmt.Errorf("send chunk packet: %w", err)}
+					return
+				}
+				bytesSent += p.Size
+				if opts.OnProgress != nil {
+					opts.OnProgress(bytesSent, info.Size())
+				}
+				delete(pendingPkts, next)
+				next++
+			}
 		}
-		return err
-	}
+		netErrCh <- netWriteResult{nil}
+	}()
 
 	idx := 0
 	for {
@@ -298,7 +328,9 @@ func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath stri
 		}
 		if err != nil {
 			close(jobs)
-			return sendErr(fmt.Errorf("chunk file: %w", err))
+			stopWorkers()
+			<-netErrCh
+			return fmt.Errorf("chunk file: %w", err)
 		}
 		if idx < resumeIndex {
 			idx++
@@ -307,37 +339,20 @@ func (t *Transport) SendFileWithOptions(ctx context.Context, addr, filePath stri
 		select {
 		case <-ctx.Done():
 			close(jobs)
-			return sendErr(ctx.Err())
+			stopWorkers()
+			<-netErrCh
+			return ctx.Err()
+		case nr := <-netErrCh:
+			close(jobs)
+			return nr.err
 		case jobs <- job{index: idx, chunk: c}:
 		}
 		idx++
 	}
 	close(jobs)
 
-	// --- In-order delivery: buffer out-of-order results, send sequentially ---
-	next := resumeIndex
-	var bytesSent int64
-	pendingPkts := make(map[int]packet)
-	for r := range results {
-		if r.err != nil {
-			return sendErr(r.err)
-		}
-		pendingPkts[r.index] = r.packet
-		for {
-			p, ok := pendingPkts[next]
-			if !ok {
-				break
-			}
-			if err := enc.Encode(p); err != nil {
-				return sendErr(fmt.Errorf("send chunk packet: %w", err))
-			}
-			bytesSent += p.Size
-			if opts.OnProgress != nil {
-				opts.OnProgress(bytesSent, info.Size())
-			}
-			delete(pendingPkts, next)
-			next++
-		}
+	if nr := <-netErrCh; nr.err != nil {
+		return nr.err
 	}
 	stopWorkers() // normal completion: signal workers (all already done)
 
@@ -709,12 +724,36 @@ func (t *Transport) SendFileOverConn(ctx context.Context, conn *quic.Conn, fileP
 
 	var stopOnce sync.Once
 	stopWorkers := func() { stopOnce.Do(func() { close(stopped) }) }
-	sendErr := func(err error) error {
-		stopWorkers()
-		for range results {
+
+	// --- In-order delivery (concurrent with job production to prevent deadlock) ---
+	type netWriteResult struct{ err error }
+	netErrCh := make(chan netWriteResult, 1)
+	go func() {
+		next := resumeIndex
+		pendingPkts := make(map[int]packet)
+		for r := range results {
+			if r.err != nil {
+				stopWorkers()
+				netErrCh <- netWriteResult{r.err}
+				return
+			}
+			pendingPkts[r.index] = r.packet
+			for {
+				p, ok := pendingPkts[next]
+				if !ok {
+					break
+				}
+				if err := enc.Encode(p); err != nil {
+					stopWorkers()
+					netErrCh <- netWriteResult{fmt.Errorf("send chunk packet: %w", err)}
+					return
+				}
+				delete(pendingPkts, next)
+				next++
+			}
 		}
-		return err
-	}
+		netErrCh <- netWriteResult{nil}
+	}()
 
 	idx := 0
 	for {
@@ -724,7 +763,9 @@ func (t *Transport) SendFileOverConn(ctx context.Context, conn *quic.Conn, fileP
 		}
 		if err != nil {
 			close(jobs)
-			return sendErr(fmt.Errorf("chunk file: %w", err))
+			stopWorkers()
+			<-netErrCh
+			return fmt.Errorf("chunk file: %w", err)
 		}
 		if idx < resumeIndex {
 			idx++
@@ -733,31 +774,20 @@ func (t *Transport) SendFileOverConn(ctx context.Context, conn *quic.Conn, fileP
 		select {
 		case <-ctx.Done():
 			close(jobs)
-			return sendErr(ctx.Err())
+			stopWorkers()
+			<-netErrCh
+			return ctx.Err()
+		case nr := <-netErrCh:
+			close(jobs)
+			return nr.err
 		case jobs <- job{index: idx, chunk: c}:
 		}
 		idx++
 	}
 	close(jobs)
 
-	next := resumeIndex
-	pendingPkts := make(map[int]packet)
-	for r := range results {
-		if r.err != nil {
-			return sendErr(r.err)
-		}
-		pendingPkts[r.index] = r.packet
-		for {
-			p, ok := pendingPkts[next]
-			if !ok {
-				break
-			}
-			if err := enc.Encode(p); err != nil {
-				return sendErr(fmt.Errorf("send chunk packet: %w", err))
-			}
-			delete(pendingPkts, next)
-			next++
-		}
+	if nr := <-netErrCh; nr.err != nil {
+		return nr.err
 	}
 	stopWorkers()
 
