@@ -575,3 +575,189 @@ func (t *Transport) clientSessionKey(enc *gob.Encoder, dec *gob.Decoder, opts Se
 	}
 	return DeriveTransferSessionKey(opts.SpaceKey, opts.AuthToken)
 }
+
+// SendFileOverConn streams filePath over an already-established QUIC connection.
+// This is used by the hole-punch path: the puncher opens the connection, and
+// this method runs the file-transfer protocol on top of it without dialling.
+func (t *Transport) SendFileOverConn(ctx context.Context, conn *quic.Conn, filePath string, engine *store.Engine, opts SendOptions) error {
+	if opts.Parallelism < 1 {
+		opts.Parallelism = 1
+	}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("open source file: %w", err)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat source file: %w", err)
+	}
+
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		return fmt.Errorf("open QUIC stream over punched conn: %w", err)
+	}
+	defer stream.Close()
+
+	enc := gob.NewEncoder(stream)
+	dec := gob.NewDecoder(stream)
+
+	sessionKey, authErr := t.clientSessionKey(enc, dec, opts)
+	if authErr != nil {
+		return authErr
+	}
+
+	if err := enc.Encode(packet{
+		Type:      "start",
+		FileName:  filepath.Base(filePath),
+		FileSize:  info.Size(),
+		FileMTime: info.ModTime().UnixNano(),
+	}); err != nil {
+		return fmt.Errorf("send start packet: %w", err)
+	}
+
+	resumeIndex := 0
+	if opts.Resume {
+		var ack packet
+		if err := dec.Decode(&ack); err != nil {
+			return fmt.Errorf("read resume ack: %w", err)
+		}
+		if ack.Type != "resume" {
+			return fmt.Errorf("unexpected handshake packet: %q", ack.Type)
+		}
+		if ack.ResumeIndex > 0 {
+			resumeIndex = ack.ResumeIndex
+		}
+	}
+
+	// Reuse the same parallel-chunk machinery as SendFileWithOptions.
+	chunker := NewChunkStream(f)
+	type job struct {
+		index int
+		chunk *chunk.Chunk
+	}
+	type result struct {
+		index  int
+		packet packet
+		err    error
+	}
+
+	stopped := make(chan struct{})
+	jobs := make(chan job, opts.Parallelism*2)
+	results := make(chan result, opts.Parallelism*2)
+
+	var wg sync.WaitGroup
+	for i := 0; i < opts.Parallelism; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				if engine != nil {
+					if _, err := engine.WriteChunk(filePath, j.chunk.Data); err != nil {
+						select {
+						case results <- result{err: fmt.Errorf("persist outgoing chunk: %w", err)}:
+						case <-stopped:
+						}
+						return
+					}
+				}
+				data := j.chunk.Data
+				if len(sessionKey) > 0 {
+					var encErr error
+					data, encErr = ProtectChunk(sessionKey, data)
+					if encErr != nil {
+						select {
+						case results <- result{err: fmt.Errorf("encrypt chunk: %w", encErr)}:
+						case <-stopped:
+						}
+						return
+					}
+				}
+				select {
+				case results <- result{
+					index: j.index,
+					packet: packet{
+						Type:  "chunk",
+						Hash:  j.chunk.Hash,
+						Data:  data,
+						Size:  j.chunk.Size,
+						Index: j.index,
+					},
+				}:
+				case <-stopped:
+					return
+				}
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var stopOnce sync.Once
+	stopWorkers := func() { stopOnce.Do(func() { close(stopped) }) }
+	sendErr := func(err error) error {
+		stopWorkers()
+		for range results {
+		}
+		return err
+	}
+
+	idx := 0
+	for {
+		c, err := chunker.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			close(jobs)
+			return sendErr(fmt.Errorf("chunk file: %w", err))
+		}
+		if idx < resumeIndex {
+			idx++
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			return sendErr(ctx.Err())
+		case jobs <- job{index: idx, chunk: c}:
+		}
+		idx++
+	}
+	close(jobs)
+
+	next := resumeIndex
+	pendingPkts := make(map[int]packet)
+	for r := range results {
+		if r.err != nil {
+			return sendErr(r.err)
+		}
+		pendingPkts[r.index] = r.packet
+		for {
+			p, ok := pendingPkts[next]
+			if !ok {
+				break
+			}
+			if err := enc.Encode(p); err != nil {
+				return sendErr(fmt.Errorf("send chunk packet: %w", err))
+			}
+			delete(pendingPkts, next)
+			next++
+		}
+	}
+	stopWorkers()
+
+	if err := enc.Encode(packet{Type: "end"}); err != nil {
+		return fmt.Errorf("send end packet: %w", err)
+	}
+	if err := stream.Close(); err != nil {
+		return fmt.Errorf("close stream: %w", err)
+	}
+	_, _ = io.ReadAll(stream)
+	return nil
+}
